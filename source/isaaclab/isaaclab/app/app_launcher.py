@@ -992,10 +992,23 @@ class AppLauncher:
                 play_button_group._play_button.visible = not flag  # type: ignore
                 play_button_group._play_button.enabled = not flag  # type: ignore
 
-    def _abort_signal_handle_callback(self, signal, frame):
-        """Handle the abort/segmentation/kill signals."""
-        # close the app
-        self._app.close()
+    def _abort_signal_handle_callback(self, signum, frame):
+        """Exit once. Do not tear Kit down from inside the signal handler.
+
+        ``SimulationApp.close()`` stops the replicator orchestrator, and that
+        path calls ``close()`` again, which re-enters this handler. The
+        recursion overflows and the process dies with SIGSEGV (exit 139).
+        ``eval_policy.sh`` treats 139 as a retry and reruns the unfinished
+        episode. Exit immediately so the shell does not restart that loop.
+        """
+        if getattr(self, "_abort_signal_handled", False):
+            os._exit(1)
+        self._abort_signal_handled = True
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+        except Exception:
+            pass
+        os._exit(1)
 
     def __patch_simulation_start_app(self, launcher_args: dict):
         if not launcher_args.get("enable_pinocchio", False):
