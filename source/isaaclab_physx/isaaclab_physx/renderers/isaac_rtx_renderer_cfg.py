@@ -135,6 +135,15 @@ class IsaacRtxRendererCfg(RendererCfg):
     global_settings: IsaacRtxRendererGlobalSettingsCfg = IsaacRtxRendererGlobalSettingsCfg()
     """Global Kit/RTX quality settings applied before RTX Hydra attach."""
 
+    tile_columns: int | None = None
+    """Optional number of columns in each camera's tiled render product.
+
+    ``None`` preserves Replicator's square-root layout. A positive integer uses
+    at most that many columns, capped by the number of camera views. Each view
+    retains its configured resolution and optical calibration. For example,
+    ten views with five columns occupy two rows without unused tiles.
+    """
+
     enable_scene_partitioning: bool = field(default_factory=isaac_rtx_per_env_scene_partition_enabled)
     """Enable per-environment scene-partition authoring.
 
@@ -210,6 +219,11 @@ class IsaacRtxRendererCfg(RendererCfg):
     - ``"zero"``: Values are clipped to zero.
     - ``"none"``: No clipping is applied. Values will be returned as ``inf``.
     """
+
+    def validate_config(self) -> None:
+        """Reject invalid tile counts before creating native render resources."""
+        if self.tile_columns is not None and (type(self.tile_columns) is not int or self.tile_columns <= 0):
+            raise ValueError("IsaacRtxRendererCfg.tile_columns must be a positive integer or None.")
 
     def supported_output_types(self) -> dict[RenderBufferKind, RenderBufferSpec]:
         """Return the per-output layouts supported by current Isaac RTX releases."""

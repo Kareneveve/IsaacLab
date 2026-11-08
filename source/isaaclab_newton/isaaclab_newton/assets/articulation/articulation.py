@@ -86,6 +86,9 @@ def _resolve_articulation_root_prim_path_expr(cfg: ArticulationCfg) -> str:
     return resolve_matching_prims_from_source(cfg.prim_path, **resolve_kwargs)[0][1]
 
 
+from .indexed_bindings import indexed_write
+
+
 class Articulation(BaseArticulation):
     """An articulation asset class.
 
@@ -375,12 +378,17 @@ class Articulation(BaseArticulation):
             env_ids: Environment indices. If None, then all indices are used.
             env_mask: Environment mask. If None, then all the instances are updated. Shape is (num_instances,).
         """
-        # use ellipses object to skip initial indices.
-        if (env_ids is None) or (env_ids == slice(None)):
-            env_ids = slice(None)
-        # reset actuators, including backend-native actuator state. None selects all
-        # environments; delayed-actuator buffers do not accept a slice.
-        self.actuators.reset(None if env_ids == slice(None) else env_ids)
+        env_ids, env_mask = self._validate_env_selection(env_ids=env_ids, env_mask=env_mask)
+        # Actuator histories accept indices, while wrench composers accept masks.
+        # Resolve the mask at this reset boundary so it takes precedence for both.
+        # Masked state writers remain allocation-free and graph-safe; reset itself
+        # materializes the selected IDs for the actuator collection.
+        if env_mask is not None:
+            mask = wp.to_torch(env_mask) if isinstance(env_mask, wp.array) else env_mask
+            env_ids = mask.nonzero(as_tuple=True)[0]
+        elif env_ids is None or (isinstance(env_ids, slice) and env_ids == slice(None)):
+            env_ids = None
+        self.actuators.reset(env_ids)
         # reset external wrenches.
         self._instantaneous_wrench_composer.reset(env_ids, env_mask)
         self._permanent_wrench_composer.reset(env_ids, env_mask)
@@ -437,6 +445,7 @@ class Articulation(BaseArticulation):
                         self._ALL_BODY_MASK,
                     ],
                 )
+            self.data._indexed_bindings.flush("body_f")
         if self._instantaneous_wrench_composer.active:
             self._instantaneous_wrench_composer.reset()
 
@@ -661,6 +670,7 @@ class Articulation(BaseArticulation):
         """
         self.write_root_link_pose_to_sim_mask(root_pose=root_pose, env_mask=env_mask, skip_forward=skip_forward)
 
+    @indexed_write("root_pose")
     def write_root_link_pose_to_sim_index(
         self,
         *,
@@ -712,6 +722,7 @@ class Articulation(BaseArticulation):
         if not skip_forward:
             self.data._reset_pose(env_ids=env_ids)
 
+    @indexed_write("root_pose")
     def write_root_link_pose_to_sim_mask(
         self,
         *,
@@ -761,6 +772,7 @@ class Articulation(BaseArticulation):
         if not skip_forward:
             self.data._reset_pose(env_mask=env_mask)
 
+    @indexed_write("root_pose")
     def write_root_com_pose_to_sim_index(
         self,
         *,
@@ -817,6 +829,7 @@ class Articulation(BaseArticulation):
         if not skip_forward:
             self.data._reset_pose(env_ids=env_ids, from_link=False)
 
+    @indexed_write("root_pose")
     def write_root_com_pose_to_sim_mask(
         self,
         *,
@@ -936,6 +949,7 @@ class Articulation(BaseArticulation):
             root_velocity=root_velocity, env_mask=env_mask, skip_forward=skip_forward
         )
 
+    @indexed_write("root_velocity")
     def write_root_com_velocity_to_sim_index(
         self,
         *,
@@ -989,6 +1003,7 @@ class Articulation(BaseArticulation):
         if not skip_forward:
             self.data._reset_velocity(env_ids=env_ids)
 
+    @indexed_write("root_velocity")
     def write_root_com_velocity_to_sim_mask(
         self,
         *,
@@ -1040,6 +1055,7 @@ class Articulation(BaseArticulation):
         if not skip_forward:
             self.data._reset_velocity(env_mask=env_mask)
 
+    @indexed_write("root_velocity")
     def write_root_link_velocity_to_sim_index(
         self,
         *,
@@ -1098,6 +1114,7 @@ class Articulation(BaseArticulation):
         if not skip_forward:
             self.data._reset_velocity(env_ids=env_ids, from_com=False)
 
+    @indexed_write("root_velocity")
     def write_root_link_velocity_to_sim_mask(
         self,
         *,
@@ -1153,6 +1170,7 @@ class Articulation(BaseArticulation):
         if not skip_forward:
             self.data._reset_velocity(env_mask=env_mask, from_com=False)
 
+    @indexed_write("joint_q", "joint_qd")
     def write_joint_state_to_sim_index(
         self,
         *,
@@ -1228,6 +1246,7 @@ class Articulation(BaseArticulation):
             self.data._reset_pose(env_ids=env_ids)
             self.data._reset_velocity(env_ids=env_ids)
 
+    @indexed_write("joint_q", "joint_qd")
     def write_joint_state_to_sim_mask(
         self,
         *,
@@ -1302,6 +1321,7 @@ class Articulation(BaseArticulation):
             self.data._reset_pose(env_mask=env_mask)
             self.data._reset_velocity(env_mask=env_mask)
 
+    @indexed_write("joint_q")
     def write_joint_position_to_sim_index(
         self,
         *,
@@ -1363,6 +1383,7 @@ class Articulation(BaseArticulation):
             self.data._reset_pose(env_ids=env_ids)
             self.data._reset_velocity(env_ids=env_ids)
 
+    @indexed_write("joint_q")
     def write_joint_position_to_sim_mask(
         self,
         *,
@@ -1421,6 +1442,7 @@ class Articulation(BaseArticulation):
             self.data._reset_pose(env_mask=env_mask)
             self.data._reset_velocity(env_mask=env_mask)
 
+    @indexed_write("joint_qd")
     def write_joint_velocity_to_sim_index(
         self,
         *,
@@ -1485,6 +1507,7 @@ class Articulation(BaseArticulation):
         if not skip_forward:
             self.data._reset_velocity(env_ids=env_ids)
 
+    @indexed_write("joint_qd")
     def write_joint_velocity_to_sim_mask(
         self,
         *,
@@ -1617,6 +1640,7 @@ class Articulation(BaseArticulation):
 
         SimulationManager.add_model_change(ModelFlags.JOINT_DOF_PROPERTIES)
 
+    @indexed_write("joint_target_ke")
     def write_joint_stiffness_to_sim_index(
         self,
         *,
@@ -1647,6 +1671,7 @@ class Articulation(BaseArticulation):
             env_ids=env_ids,
         )
 
+    @indexed_write("joint_target_ke")
     def write_joint_stiffness_to_sim_mask(
         self,
         *,
@@ -1677,6 +1702,7 @@ class Articulation(BaseArticulation):
             env_mask=env_mask,
         )
 
+    @indexed_write("joint_target_kd")
     def write_joint_damping_to_sim_index(
         self,
         *,
@@ -1751,6 +1777,7 @@ class Articulation(BaseArticulation):
         """
         self._write_deprecated_native_actuator_gain("write_actuator_damping_to_sim", "kd", damping, env_ids, joint_ids)
 
+    @indexed_write("joint_target_kd")
     def write_joint_damping_to_sim_mask(
         self,
         *,
@@ -1781,6 +1808,7 @@ class Articulation(BaseArticulation):
             env_mask=env_mask,
         )
 
+    @indexed_write("joint_limit_lower", "joint_limit_upper")
     def write_joint_position_limit_to_sim_index(
         self,
         *,
@@ -1856,6 +1884,7 @@ class Articulation(BaseArticulation):
             )
         SimulationManager.add_model_change(ModelFlags.JOINT_DOF_PROPERTIES)
 
+    @indexed_write("joint_limit_lower", "joint_limit_upper")
     def write_joint_position_limit_to_sim_mask(
         self,
         *,
@@ -1931,6 +1960,7 @@ class Articulation(BaseArticulation):
             )
         SimulationManager.add_model_change(ModelFlags.JOINT_DOF_PROPERTIES)
 
+    @indexed_write("joint_velocity_limit")
     def write_joint_velocity_limit_to_sim_index(
         self,
         *,
@@ -1965,6 +1995,7 @@ class Articulation(BaseArticulation):
             env_ids=env_ids,
         )
 
+    @indexed_write("joint_velocity_limit")
     def write_joint_velocity_limit_to_sim_mask(
         self,
         *,
@@ -1999,6 +2030,7 @@ class Articulation(BaseArticulation):
             env_mask=env_mask,
         )
 
+    @indexed_write("joint_effort_limit")
     def write_joint_effort_limit_to_sim_index(
         self,
         *,
@@ -2032,6 +2064,7 @@ class Articulation(BaseArticulation):
             env_ids=env_ids,
         )
 
+    @indexed_write("joint_effort_limit")
     def write_joint_effort_limit_to_sim_mask(
         self,
         *,
@@ -2065,6 +2098,7 @@ class Articulation(BaseArticulation):
             env_mask=env_mask,
         )
 
+    @indexed_write("joint_armature")
     def write_joint_armature_to_sim_index(
         self,
         *,
@@ -2098,6 +2132,7 @@ class Articulation(BaseArticulation):
             env_ids=env_ids,
         )
 
+    @indexed_write("joint_armature")
     def write_joint_armature_to_sim_mask(
         self,
         *,
@@ -2131,6 +2166,7 @@ class Articulation(BaseArticulation):
             env_mask=env_mask,
         )
 
+    @indexed_write("joint_friction")
     def write_joint_friction_coefficient_to_sim_index(
         self,
         *,
@@ -2195,6 +2231,7 @@ class Articulation(BaseArticulation):
             env_ids=env_ids,
         )
 
+    @indexed_write("joint_friction")
     def write_joint_friction_coefficient_to_sim_mask(
         self,
         *,
@@ -2238,6 +2275,7 @@ class Articulation(BaseArticulation):
             env_mask=env_mask,
         )
 
+    @indexed_write("joint_damping")
     def write_joint_viscous_friction_coefficient_to_sim_index(
         self,
         *,
@@ -2265,6 +2303,7 @@ class Articulation(BaseArticulation):
             env_ids=env_ids,
         )
 
+    @indexed_write("joint_damping")
     def write_joint_viscous_friction_coefficient_to_sim_mask(
         self,
         *,
@@ -2324,6 +2363,7 @@ class Articulation(BaseArticulation):
     Operations - Setters.
     """
 
+    @indexed_write("body_mass", "body_inv_mass", "body_inv_inertia")
     def set_masses_index(
         self,
         *,
@@ -2373,6 +2413,7 @@ class Articulation(BaseArticulation):
         # tell the physics engine that some of the body properties have been updated
         SimulationManager.add_model_change(ModelFlags.BODY_INERTIAL_PROPERTIES)
 
+    @indexed_write("body_mass", "body_inv_mass", "body_inv_inertia")
     def set_masses_mask(
         self,
         *,
@@ -2421,6 +2462,7 @@ class Articulation(BaseArticulation):
         # tell the physics engine that some of the body properties have been updated
         SimulationManager.add_model_change(ModelFlags.BODY_INERTIAL_PROPERTIES)
 
+    @indexed_write("body_com")
     def set_coms_index(
         self,
         *,
@@ -2473,6 +2515,7 @@ class Articulation(BaseArticulation):
         # tell the physics engine that some of the body properties have been updated
         SimulationManager.add_model_change(ModelFlags.BODY_INERTIAL_PROPERTIES)
 
+    @indexed_write("body_com")
     def set_coms_mask(
         self,
         *,
@@ -2524,6 +2567,7 @@ class Articulation(BaseArticulation):
         # tell the physics engine that some of the body properties have been updated
         SimulationManager.add_model_change(ModelFlags.BODY_INERTIAL_PROPERTIES)
 
+    @indexed_write("body_inertia", "body_inv_inertia")
     def set_inertias_index(
         self,
         *,
@@ -2574,6 +2618,7 @@ class Articulation(BaseArticulation):
         # tell the physics engine that some of the body properties have been updated
         SimulationManager.add_model_change(ModelFlags.BODY_INERTIAL_PROPERTIES)
 
+    @indexed_write("body_inertia", "body_inv_inertia")
     def set_inertias_mask(
         self,
         *,
@@ -3087,6 +3132,7 @@ class Articulation(BaseArticulation):
         """
         raise _unsupported_fixed_tendon_property("offset")
 
+    @indexed_write("mujoco.tendon_stiffness", "mujoco.tendon_damping", "mujoco.tendon_range")
     def write_fixed_tendon_properties_to_sim_index(
         self,
         *,
@@ -3118,6 +3164,7 @@ class Articulation(BaseArticulation):
         # the solver keeps its own copy of the tendon properties and only re-reads them when notified
         SimulationManager.add_model_change(ModelFlags.TENDON_PROPERTIES)
 
+    @indexed_write("mujoco.tendon_stiffness", "mujoco.tendon_damping", "mujoco.tendon_range")
     def write_fixed_tendon_properties_to_sim_mask(
         self,
         *,
@@ -3399,12 +3446,14 @@ class Articulation(BaseArticulation):
     """
 
     def _initialize_impl(self):
+        self._clear_simulation_callbacks()
         root_prim_path_expr = _resolve_articulation_root_prim_path_expr(self.cfg)
         # -- articulation
         self._root_view = SimulationManager.views[SimulationManager, root_prim_path_expr] = ArticulationView(
             SimulationManager.get_model(),
             re.compile(root_prim_path_expr),
             verbose=False,
+            homogeneous=False,
             exclude_joint_types=[JointType.FREE, JointType.FIXED],
         )
 
@@ -3439,16 +3488,19 @@ class Articulation(BaseArticulation):
         if hasattr(self, "_model_init_handle") and self._model_init_handle is not None:
             self._model_init_handle.deregister()
             self._model_init_handle = None
-        if hasattr(self, "_physics_ready_handle") and self._physics_ready_handle is not None:
-            self._physics_ready_handle.deregister()
+        self._clear_simulation_callbacks()
+
+    def _clear_simulation_callbacks(self) -> None:
+        """Release callbacks retaining model-specific bindings before rebuilding."""
+        if (handle := getattr(self, "_physics_ready_handle", None)) is not None:
+            handle.deregister()
             self._physics_ready_handle = None
-        # Remove the post-step republish hook registered in ``_create_buffers`` so the
-        # bound method does not linger on ``NewtonManager._post_step_callbacks`` after
-        # this articulation is gone (registered only for non-identity ordering).
-        post_step_callback = getattr(self, "_post_step_callback", None)
-        if post_step_callback is not None:
-            SimulationManager.unregister_post_step_callback(post_step_callback)
+        if (callback := getattr(self, "_post_step_callback", None)) is not None:
+            SimulationManager.unregister_post_step_callback(callback)
             self._post_step_callback = None
+        if (callback := getattr(self, "_post_actuator_callback", None)) is not None:
+            SimulationManager.unregister_post_actuator_callback(callback)
+            self._post_actuator_callback = None
 
     def _create_buffers(self):
         self._ALL_INDICES = wp.array(np.arange(self.num_instances, dtype=np.int32), device=self.device)
@@ -3493,7 +3545,12 @@ class Articulation(BaseArticulation):
         # A ball-jointed articulation also needs the slot: its DOF-space joint_pos is derived, not
         # sim-bound, so it has to be republished after every step just like the ordering shadows.
         self._post_step_callback = None
-        if self.data.has_joint_ordering or self.data.has_body_ordering or self.data._joint_coord_map.required:
+        if (
+            self.data.has_joint_ordering
+            or self.data.has_body_ordering
+            or self.data._joint_coord_map.required
+            or self.data._indexed_bindings.enabled
+        ):
             self._post_step_callback = self._data._refresh_user_order_state
             SimulationManager.register_post_step_callback(self._post_step_callback)
         # tendon names are set in _process_tendons function
@@ -3719,6 +3776,81 @@ class Articulation(BaseArticulation):
 
         if self.num_spatial_tendons > 0:
             raise NotImplementedError("Spatial tendons are not supported yet.")
+
+    def _validate_env_selection(self, *, env_ids=None, env_mask=None):
+        """Validate state-write/reset rows before any native mutation.
+
+        A boolean mask takes precedence and is checked without reading device
+        values. Explicit index arrays are non-capture inputs: checking their
+        values may synchronize a small CUDA selector. Per-step actuator writes,
+        full selection, and mask-based captured writers do not use that path.
+        Duplicate rows are rejected because parallel writers could otherwise
+        race when the rows carry different values.
+        """
+        if env_mask is not None:
+            if isinstance(env_mask, torch.Tensor):
+                valid_dtype = env_mask.dtype == torch.bool
+                device = wp.get_device(str(env_mask.device))
+            elif isinstance(env_mask, wp.array):
+                valid_dtype = env_mask.dtype == wp.bool
+                device = env_mask.device
+            else:
+                raise TypeError("env_mask must be a boolean torch.Tensor or wp.array.")
+            if not valid_dtype:
+                raise TypeError("env_mask must have boolean dtype.")
+            if tuple(env_mask.shape) != (self.num_instances,):
+                raise ValueError(f"env_mask must have shape ({self.num_instances},), got {tuple(env_mask.shape)}.")
+            if device != wp.get_device(self.device):
+                raise ValueError("env_mask must be on the articulation device.")
+            return None, env_mask
+
+        if env_ids is None or env_ids is self._ALL_INDICES:
+            return env_ids, None
+        if isinstance(env_ids, slice):
+            # Python slicing clips bounds and cannot introduce an invalid row.
+            return env_ids, None
+        if isinstance(env_ids, ProxyArray):
+            raise TypeError("ProxyArray is output-only; pass .warp or .torch explicitly.")
+        device = wp.get_device(self.device)
+        if device.is_cuda and (device.is_capturing or torch.cuda.is_current_stream_capturing()):
+            raise RuntimeError("Explicit env_ids validation is not capture-safe; use the boolean env_mask writer.")
+        if isinstance(env_ids, torch.Tensor):
+            if env_ids.dtype not in (torch.int32, torch.int64):
+                raise TypeError("env_ids must use signed 32-bit or signed 64-bit integers.")
+            if env_ids.ndim != 1:
+                raise ValueError("env_ids must be a one-dimensional index array.")
+            if wp.get_device(str(env_ids.device)) != device:
+                raise ValueError("env_ids must be on the articulation device; use a Python sequence for host indices.")
+            values = env_ids.detach().cpu().numpy()
+        elif isinstance(env_ids, wp.array):
+            if env_ids.dtype not in (wp.int32, wp.int64):
+                raise TypeError("env_ids must use signed 32-bit or signed 64-bit integers.")
+            if env_ids.ndim != 1:
+                raise ValueError("env_ids must be a one-dimensional index array.")
+            if env_ids.device != device:
+                raise ValueError("env_ids must be on the articulation device; use a Python sequence for host indices.")
+            values = env_ids.numpy()
+        elif isinstance(env_ids, np.ndarray):
+            values = env_ids
+        elif isinstance(env_ids, Sequence) and not isinstance(env_ids, (str, bytes)):
+            if any(
+                isinstance(index, (bool, np.bool_)) or not isinstance(index, (int, np.integer)) for index in env_ids
+            ):
+                raise TypeError("env_ids must contain integer indices, not booleans or floats.")
+            values = np.asarray(env_ids) if len(env_ids) else np.empty(0, dtype=np.int64)
+        else:
+            raise TypeError("env_ids must be an integer sequence, tensor, Warp array, or slice.")
+        if values.ndim != 1:
+            raise ValueError("env_ids must be a one-dimensional index array.")
+        if values.dtype not in (np.dtype(np.int32), np.dtype(np.int64)):
+            raise TypeError("env_ids must use signed 32-bit or signed 64-bit integers.")
+        if values.size and (int(values.min()) < 0 or int(values.max()) >= self.num_instances):
+            raise ValueError(f"env_ids must be in [0, {self.num_instances}).")
+        if np.unique(values).size != values.size:
+            raise ValueError("env_ids must not contain duplicate rows; parallel writes would race.")
+        if not isinstance(env_ids, (torch.Tensor, wp.array)):
+            env_ids = values.tolist()
+        return env_ids, None
 
     def _resolve_env_ids(self, env_ids: Sequence[int] | torch.Tensor | wp.array | None) -> wp.array | torch.Tensor:
         """Resolve environment indices.

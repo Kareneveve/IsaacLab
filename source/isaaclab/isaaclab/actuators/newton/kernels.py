@@ -56,6 +56,46 @@ def build_per_dof_env_mask_kernel(
     out_mask[i] = env_mask[env]
 
 
+@wp.kernel(enable_backward=False)
+def build_indexed_dof_env_mask_kernel(
+    indices: wp.array(dtype=wp.uint32),
+    dof_world: wp.array(dtype=wp.int32),
+    env_mask: wp.array(dtype=wp.bool),
+    out_mask: wp.array(dtype=wp.bool),
+):
+    """Select actuator entries by their real world, independent of array spacing."""
+    i = wp.tid()
+    world = dof_world[indices[i]]
+    out_mask[i] = False
+    if world >= 0:
+        out_mask[i] = env_mask[world]
+
+
+@wp.kernel(enable_backward=False)
+def gather_indexed_effort_kernel(
+    source: wp.array(dtype=wp.float32),
+    indices: wp.array2d(dtype=wp.int32),
+    output: wp.array2d(dtype=wp.float32),
+):
+    """Refresh articulation telemetry from the full native effort buffer."""
+    world, joint = wp.tid()
+    output[world, joint] = source[indices[world, joint]]
+
+
+@wp.kernel(enable_backward=False)
+def clear_indexed_effort_kernel(
+    values: wp.array(dtype=wp.float32),
+    dof_world: wp.array(dtype=wp.int32),
+    env_mask: wp.array(dtype=wp.bool),
+):
+    """Discard only selected worlds' previous computed effort on local reset."""
+    dof = wp.tid()
+    world = dof_world[dof]
+    if world >= 0:
+        if env_mask[world]:
+            values[dof] = 0.0
+
+
 # ---------------------------------------------------------------------------
 # Articulation-level kernels: in-graph post-actuator hook.
 # ---------------------------------------------------------------------------

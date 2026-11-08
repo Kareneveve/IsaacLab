@@ -33,7 +33,10 @@ from newton.selection import ArticulationView
 from ...utils import index_fill_
 from .kernels import (
     build_implicit_dof_mask,
+    build_indexed_dof_env_mask_kernel,
     build_per_dof_env_mask_kernel,
+    clear_indexed_effort_kernel,
+    gather_indexed_effort_kernel,
     set_mask_kernel,
     zero_at_indices_kernel,
 )
@@ -71,6 +74,22 @@ class NewtonActuatorAdapter:
         computed_effort_view: wp.array
         """This articulation's slice of the adapter's pre-clamp computed-effort buffer, ``(num_envs, num_joints)``."""
 
+        native_dof_indices: wp.array | None = None
+        """Absolute native DOF IDs when telemetry requires an indexed gather."""
+
+        computed_effort_source: wp.array | None = None
+        """Full native effort array backing an indexed telemetry buffer."""
+
+        def refresh_computed_effort(self) -> None:
+            """Refresh indexed telemetry inside each post-actuator graph iteration."""
+            if self.native_dof_indices is not None:
+                wp.launch(
+                    gather_indexed_effort_kernel,
+                    dim=self.computed_effort_view.shape,
+                    inputs=[self.computed_effort_source, self.native_dof_indices, self.computed_effort_view],
+                    device=self.computed_effort_view.device,
+                )
+
     def __init__(
         self,
         actuators: list[Actuator],
@@ -78,6 +97,8 @@ class NewtonActuatorAdapter:
         num_joints: int,
         dof_offset: int,
         device: str,
+        *,
+        dof_world: np.ndarray | None = None,
     ):
         self.actuators = actuators
         self.num_joints = num_joints
@@ -85,20 +106,36 @@ class NewtonActuatorAdapter:
         self._num_envs = num_envs
         self._dof_offset = dof_offset
         self._device = device
+        self._dof_world_host = None
+        self._dof_world = None
+        if dof_world is not None:
+            worlds = np.asarray(dof_world)
+            if worlds.ndim != 1 or not np.issubdtype(worlds.dtype, np.integer):
+                raise ValueError("dof_world must contain one integer world ID per native DOF")
+            if np.any(worlds < -1) or np.any(worlds >= num_envs):
+                raise ValueError("dof_world contains an invalid model world ID")
+            self._dof_world_host = worlds.astype(np.int32, copy=True)
+            self._dof_world = wp.array(self._dof_world_host, dtype=wp.int32, device=device)
 
-        # Collect the set of local DOFs covered by some actuator. Only the
-        # env-0 slice of each actuator's flat ``indices`` array is needed —
-        # later envs are repeats with a constant ``num_joints`` stride.
+        # Host adapters expose local DOFs repeated at a constant stride. A
+        # native model exposes absolute DOFs, whose world lengths can differ.
         managed: set[int] = set()
         for act in actuators:
             all_indices = act.indices.numpy()
+            if self._dof_world_host is not None:
+                if np.any(all_indices >= len(self._dof_world_host)) or np.any(
+                    act.effort_indices.numpy() >= len(self._dof_world_host)
+                ):
+                    raise ValueError("Actuator indices exceed the native DOF array")
+                managed.update(int(index) for index in all_indices)
+                continue
             num_per_act = len(all_indices) // num_envs
             for global_dof in all_indices[:num_per_act]:
                 local_dof = global_dof - dof_offset
                 if 0 <= local_dof < num_joints:
                     managed.add(local_dof)
 
-        if len(managed) == num_joints:
+        if self._dof_world_host is None and len(managed) == num_joints:
             self.joint_indices: torch.Tensor | slice = slice(None)
         else:
             self.joint_indices = torch.tensor(sorted(managed), dtype=torch.int32, device=device)
@@ -113,11 +150,15 @@ class NewtonActuatorAdapter:
         # computed (pre-clamp) effort instead of mirroring ``joint_f``. The
         # binding onto ``sim_control`` happens in :meth:`finalize`.
         self._computed_effort = wp.zeros(
-            num_envs * num_joints,
+            num_envs * num_joints if self._dof_world_host is None else len(self._dof_world_host),
             dtype=wp.float32,
             device=device,
         )
-        self.computed_effort_2d = self._computed_effort.reshape((num_envs, num_joints))
+        self.computed_effort_2d = (
+            self._computed_effort.reshape((num_envs, num_joints)) if self._dof_world_host is None else None
+        )
+        self._reset_env_mask = wp.zeros(num_envs, dtype=wp.bool, device=device)
+        self._reset_dof_masks = [wp.empty(act.indices.shape, dtype=wp.bool, device=device) for act in actuators]
         for act in actuators:
             act.control_computed_output_attr = "joint_computed_f"
 
@@ -188,6 +229,7 @@ class NewtonActuatorAdapter:
         env mask before delegating to each state.
         """
         if env_ids is None or env_ids == slice(None):
+            self._computed_effort.zero_()
             for sa, sb in zip(self._states_a, self._states_b):
                 if sa is not None:
                     sa.reset(None)
@@ -198,7 +240,8 @@ class NewtonActuatorAdapter:
         num_envs = len(range(self._num_envs)[env_ids]) if isinstance(env_ids, slice) else len(env_ids)
         if num_envs == 0:
             return
-        env_mask = wp.zeros(self._num_envs, dtype=wp.bool, device=self._device)
+        env_mask = self._reset_env_mask
+        env_mask.zero_()
         if isinstance(env_ids, slice):
             wp.to_torch(env_mask)[env_ids] = True
         else:
@@ -210,14 +253,21 @@ class NewtonActuatorAdapter:
             )
             wp.launch(set_mask_kernel, dim=num_envs, inputs=[env_mask, indices], device=self._device)
 
-        for act, sa, sb in zip(self.actuators, self._states_a, self._states_b):
-            per_dof_mask = wp.zeros(act.indices.shape[0], dtype=wp.bool, device=self._device)
+        if self._dof_world is not None:
             wp.launch(
-                build_per_dof_env_mask_kernel,
-                dim=act.indices.shape[0],
-                inputs=[act.indices, env_mask, self._dof_offset, self.num_joints, per_dof_mask],
+                clear_indexed_effort_kernel,
+                dim=self._computed_effort.shape,
+                inputs=[self._computed_effort, self._dof_world, env_mask],
                 device=self._device,
             )
+        for act, sa, sb, per_dof_mask in zip(self.actuators, self._states_a, self._states_b, self._reset_dof_masks):
+            if self._dof_world is None:
+                kernel = build_per_dof_env_mask_kernel
+                inputs = [act.indices, env_mask, self._dof_offset, self.num_joints, per_dof_mask]
+            else:
+                kernel = build_indexed_dof_env_mask_kernel
+                inputs = [act.indices, self._dof_world, env_mask, per_dof_mask]
+            wp.launch(kernel, dim=act.indices.shape[0], inputs=inputs, device=self._device)
             if sa is not None:
                 sa.reset(per_dof_mask)
             if sb is not None:
@@ -229,6 +279,8 @@ class NewtonActuatorAdapter:
         implicit_joint_indices: Sequence[slice | torch.Tensor | None],
         dof_offset: int,
         num_joints: int,
+        native_dof_indices: wp.array | None = None,
+        world_ids: wp.array | None = None,
     ) -> ArticulationBinding:
         """Assemble the Newton fast-path init state for one articulation.
 
@@ -245,6 +297,10 @@ class NewtonActuatorAdapter:
             num_joints: Articulation-local joint count. Distinct from
                 :attr:`num_joints`, which is the whole-model per-env DOF
                 stride used to lay out the actuator index arrays.
+            native_dof_indices: Absolute native DOF indices with shape
+                ``(view_world_count, num_joints)``. Required for indexed models.
+            world_ids: Model world ID of each indexed view row. Used to validate
+                that telemetry cannot read another world's DOFs.
 
         Returns:
             The bundled :class:`ArticulationBinding` for this articulation.
@@ -252,11 +308,31 @@ class NewtonActuatorAdapter:
         implicit_dof_mask, implicit_dof_mask_owner = build_implicit_dof_mask(
             implicit_joint_indices, num_joints, self._device
         )
-        computed_effort_view = self.computed_effort_2d[:, dof_offset : dof_offset + num_joints]
+        if native_dof_indices is None:
+            if self.computed_effort_2d is None:
+                raise ValueError("Indexed actuator models require native_dof_indices when binding an articulation")
+            computed_effort_view = self.computed_effort_2d[:, dof_offset : dof_offset + num_joints]
+        else:
+            if native_dof_indices.ndim != 2 or native_dof_indices.shape[1] != num_joints:
+                raise ValueError("native_dof_indices must have shape (view_world_count, num_joints)")
+            if native_dof_indices.dtype != wp.int32 or native_dof_indices.device != wp.get_device(self._device):
+                raise ValueError("native_dof_indices must be an int32 array on the adapter device")
+            native_ids = native_dof_indices.numpy()
+            if np.any(native_ids < 0) or np.any(native_ids >= self._computed_effort.shape[0]):
+                raise ValueError("native_dof_indices contains an invalid native DOF")
+            if world_ids is None or world_ids.shape != (native_ids.shape[0],):
+                raise ValueError("world_ids must identify every indexed articulation row")
+            if self._dof_world_host is not None and np.any(
+                self._dof_world_host[native_ids] != world_ids.numpy()[:, None]
+            ):
+                raise ValueError("Articulation DOF indices do not belong to the specified worlds")
+            computed_effort_view = wp.zeros(native_dof_indices.shape, dtype=wp.float32, device=self._device)
         return self.ArticulationBinding(
             implicit_dof_mask=implicit_dof_mask,
             implicit_dof_mask_owner=implicit_dof_mask_owner,
             computed_effort_view=computed_effort_view,
+            native_dof_indices=native_dof_indices,
+            computed_effort_source=self._computed_effort if native_dof_indices is not None else None,
         )
 
     @property

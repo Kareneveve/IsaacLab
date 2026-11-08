@@ -19,7 +19,7 @@ import numpy as np
 import warp as wp
 from packaging import version
 
-from pxr import Sdf, Usd, UsdGeom
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdRender
 
 from isaaclab.app.settings_manager import get_settings_manager
 from isaaclab.renderers import BaseRenderer, RenderBufferKind, RenderBufferSpec
@@ -144,6 +144,8 @@ class IsaacRtxRenderData:
 
     annotators: dict[str, Any]
     render_product: HydraTexture
+    tile_grid: tuple[int, int]
+    """Actual render-product layout as (columns, rows), shared by all decoders."""
     output_data: dict[str, ProxyArray] | None = None
     spec: CameraRenderSpec | None = None
     renderer_info: dict[str, Any] = field(default_factory=dict)
@@ -203,6 +205,7 @@ class IsaacRtxRenderer(BaseRenderer):
     """
 
     def __init__(self, cfg: IsaacRtxRendererCfg):
+        cfg.validate_config()
         self.cfg = cfg
         # Enable Replicator only when the Isaac RTX renderer is selected. Declaring it
         # in a Kit experience would resolve its bundled omni.warp.core dependency at startup.
@@ -368,6 +371,7 @@ class IsaacRtxRenderer(BaseRenderer):
                 for prim in stage.Traverse():
                     prim.SetInstanceable(False)
 
+        self.cfg.validate_config()
         # Get camera prim paths from sensor view
         cam_prim_paths = list(spec.camera_prim_paths)
         for cam_prim_path in cam_prim_paths:
@@ -495,6 +499,8 @@ class IsaacRtxRenderer(BaseRenderer):
         for annotator in annotators.values():
             annotator.attach([rp.path])
 
+        tile_grid = self._configure_tile_grid(stage, rp.path, spec)
+
         # Annotator attachment may resynchronize process-wide RTX settings onto the product.
         if simple_shading_mode is not None:
             self._apply_simple_shading_settings(
@@ -516,11 +522,35 @@ class IsaacRtxRenderer(BaseRenderer):
         return IsaacRtxRenderData(
             annotators=annotators,
             render_product=rp,
+            tile_grid=tile_grid,
             render_product_name=product_name,
             render_product_stage_key=stage_key,
             spec=spec,
             ppisp_pipeline=ppisp_pipeline,
         )
+
+    def _configure_tile_grid(self, stage: Any, product_path: str, spec: CameraRenderSpec) -> tuple[int, int]:
+        """Resolve the decoder grid and author explicit native viewport dimensions."""
+        view_count = len(spec.camera_prim_paths)
+        if view_count == 0:
+            raise ValueError("Isaac RTX tiled rendering requires at least one camera view.")
+        columns = (
+            math.ceil(math.sqrt(view_count))
+            if self.cfg.tile_columns is None
+            else min(self.cfg.tile_columns, view_count)
+        )
+        grid = (columns, math.ceil(view_count / columns))
+        if self.cfg.tile_columns is not None:
+            # Annotator attachment can resynchronize product settings. Author
+            # the native layout afterwards, before the first rendered frame.
+            prim = stage.GetPrimAtPath(product_path)
+            prim.CreateAttribute("omni:rtx:viewTile:resolution", Sdf.ValueTypeNames.Int2).Set(
+                Gf.Vec2i(spec.cfg.width, spec.cfg.height)
+            )
+            UsdRender.Product(prim).GetResolutionAttr().Set(
+                Gf.Vec2i(grid[0] * spec.cfg.width, grid[1] * spec.cfg.height)
+            )
+        return grid
 
     def _apply_simple_shading_settings(
         self,
@@ -648,6 +678,10 @@ class IsaacRtxRenderer(BaseRenderer):
             render_data: Cameras whose poses and output buffers have been prepared. Entries
                 without a spec or output buffers are skipped. An empty sequence performs no work.
         """
+        # A failed fence must not let a later Kit update recycle a buffer still
+        # used by our GPU consumer. Keep its owners on the renderer until retry
+        # succeeds; cleanup follows the same rule before destroying products.
+        self._finish_annotator_reads()
         cameras = [data for data in render_data if data.output_data is not None and data.spec is not None]
         if not cameras:
             return
@@ -657,11 +691,50 @@ class IsaacRtxRenderer(BaseRenderer):
         # for the current physics step, or if a visualizer already pumped it.
         ensure_isaac_rtx_render_update()
 
-        for data in cameras:
-            self._read_annotator_output(data)
+        # Retain destination buffers/products too if a failed fence postpones
+        # completion beyond this call's stack lifetime.
+        self._annotator_read_owners = list(cameras)
+        self._annotator_read_streams = {}
+        try:
+            for data in cameras:
+                device = wp.get_device(data.spec.device)
+                stream = wp.get_stream(device) if device.is_cuda else None
+                if stream is not None:
+                    self._annotator_read_streams[(str(device), stream.cuda_stream)] = stream
+                # Replicator's owned copy and our reshaping must use the same
+                # stream. The batch fence also makes output safe for a caller
+                # on another stream (including a Torch host transfer).
+                with wp.ScopedStream(stream):
+                    self._read_annotator_output(data, self._annotator_read_owners)
+        finally:
+            self._finish_annotator_reads()
 
-    def _read_annotator_output(self, render_data: IsaacRtxRenderData) -> None:
+    def _finish_annotator_reads(self) -> None:
+        """Finish only this renderer's read streams before releasing frame owners."""
+        # These resources are allocated lazily on the first nonempty capture.
+        streams = getattr(self, "_annotator_read_streams", None)
+        if streams is None:
+            return
+        first_error = None
+        for stream in streams.values():
+            try:
+                wp.synchronize_stream(stream)
+            except Exception as error:
+                # Try every submitted stream; keep all owners if any fence
+                # fails, and refuse the next capture or product destruction.
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+        self._annotator_read_owners.clear()
+        streams.clear()
+
+    def _read_annotator_output(self, render_data: IsaacRtxRenderData, owners: list[Any] | None = None) -> None:
         """Extract one camera's annotator data into its bound output buffers."""
+        if owners is None:
+            # Keep standalone reads under the same ownership/fence boundary.
+            self.render_batch((render_data,))
+            return
         spec = render_data.spec
         output_data = render_data.output_data
         assert output_data is not None and spec is not None
@@ -670,17 +743,16 @@ class IsaacRtxRenderer(BaseRenderer):
         cfg = spec.cfg
         device = spec.device
 
-        def tiling_grid_shape():
-            cols = math.ceil(math.sqrt(view_count))
-            rows = math.ceil(view_count / cols)
-            return (cols, rows)
-
-        num_tiles_x, num_tiles_y = tiling_grid_shape()
+        num_tiles_x, num_tiles_y = render_data.tile_grid
 
         # Extract the flattened image buffer
         for data_type, annotator in render_data.annotators.items():
             # check whether returned data is a dict (used for segmentation)
-            output = annotator.get_data()
+            # GPU arrays normally borrow native annotator storage. Request a
+            # Replicator-owned copy, retaining it until all batch GPU work has
+            # completed; copy=True alone does not wait for that work.
+            output = annotator.get_data(do_array_copy=True) if wp.get_device(device).is_cuda else annotator.get_data()
+            owners.append(output)
             if isinstance(output, dict):
                 tiled_data_buffer = output["data"]
                 render_data.renderer_info[data_type] = output["info"]
@@ -697,6 +769,13 @@ class IsaacRtxRenderer(BaseRenderer):
             if tiled_data_buffer.size == 0:
                 buf_wp.zero_()
                 continue
+            expected_shape = (num_tiles_y * cfg.height, num_tiles_x * cfg.width)
+            actual_shape = tuple(int(size) for size in tiled_data_buffer.shape[:2])
+            if actual_shape != expected_shape:
+                raise ValueError(
+                    f"Isaac RTX {data_type} annotator image has size {actual_shape}; expected {expected_shape}"
+                    f" for tile grid {render_data.tile_grid}. The render product layout changed or is not supported."
+                )
 
             # convert data buffer to warp array
             if isinstance(tiled_data_buffer, np.ndarray):
@@ -705,6 +784,7 @@ class IsaacRtxRenderer(BaseRenderer):
                 tiled_data_buffer = wp.array(tiled_data_buffer, device=device)
             else:
                 tiled_data_buffer = tiled_data_buffer.to(device=device)
+            owners.append(tiled_data_buffer)
 
             # process data for different segmentation types
             # Note: Replicator returns raw buffers of dtype uint32 for segmentation types
@@ -717,6 +797,7 @@ class IsaacRtxRenderer(BaseRenderer):
                 tiled_data_buffer = wp.array(
                     ptr=tiled_data_buffer.ptr, shape=(*tiled_data_buffer.shape, 4), dtype=wp.uint8, device=device
                 )
+                owners.append(tiled_data_buffer)
 
             tile_height, tile_width, num_channels = (int(dim) for dim in buf_wp.shape[1:])
             # Motion vectors, normals, HDR color, and simple shading annotators return 4 channels while the
@@ -744,6 +825,7 @@ class IsaacRtxRenderer(BaseRenderer):
                 dtype=tiled_source.dtype,
                 device=device,
             )
+            owners.append(tiled_data_buffer)
 
             wp.launch(
                 kernel=reshape_tiled_image,
@@ -802,6 +884,8 @@ class IsaacRtxRenderer(BaseRenderer):
         See :meth:`~isaaclab.renderers.base_renderer.BaseRenderer.cleanup`."""
         if render_data is None:
             return
+
+        self._finish_annotator_reads()
 
         for annotator in render_data.annotators.values():
             annotator.detach([render_data.render_product.path])

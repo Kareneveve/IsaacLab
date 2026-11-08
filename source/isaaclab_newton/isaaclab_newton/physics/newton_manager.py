@@ -137,6 +137,43 @@ def _scatter_reset_masks_from_ids_kernel(env_ids: wp.array | torch.Tensor) -> wp
 
 
 @wp.kernel(enable_backward=False)
+def _or_indexed_reset_masks(
+    env_mask: wp.array(dtype=wp.bool),
+    world_ids: wp.array(dtype=int),
+    articulation_ids: wp.array2d(dtype=int),
+    world_mask: wp.array(dtype=wp.bool),
+    fk_mask: wp.array(dtype=wp.bool),
+):
+    row, arti = wp.tid()
+    if env_mask[row]:
+        world = world_ids[row]
+        if world < 0:
+            world = world_mask.shape[0] - 1
+        world_mask[world] = True
+        fk_mask[articulation_ids[row, arti]] = True
+
+
+@wp.kernel(enable_backward=False)
+def _scatter_indexed_reset_masks(
+    env_ids: wp.array(dtype=Any),
+    world_ids: wp.array(dtype=int),
+    articulation_ids: wp.array2d(dtype=int),
+    world_mask: wp.array(dtype=wp.bool),
+    fk_mask: wp.array(dtype=wp.bool),
+):
+    i, arti = wp.tid()
+    row = wp.int32(env_ids[i])
+    world = world_ids[row]
+    if world < 0:
+        world = world_mask.shape[0] - 1
+    world_mask[world] = True
+    fk_mask[articulation_ids[row, arti]] = True
+
+
+_SCATTER_INDEXED_RESET_MASKS = IndexKernelDispatcher(_scatter_indexed_reset_masks, ("env_ids",))
+
+
+@wp.kernel(enable_backward=False)
 def _or_world_reset_mask_from_mask(env_mask: wp.array(dtype=wp.bool), world_mask: wp.array(dtype=wp.bool)):
     """Mark masked worlds for solver reset without requesting FK."""
     world = wp.tid()
@@ -1056,7 +1093,11 @@ class NewtonManager(PhysicsManager):
 
     @classmethod
     def invalidate_fk(
-        cls, env_mask: wp.array | None = None, env_ids: wp.array | None = None, articulation_ids: wp.array | None = None
+        cls,
+        env_mask: wp.array | None = None,
+        env_ids: wp.array | None = None,
+        articulation_ids: wp.array | None = None,
+        world_ids: wp.array | None = None,
     ) -> None:
         """Mark environments as needing FK recomputation and solver reset.
 
@@ -1072,6 +1113,7 @@ class NewtonManager(PhysicsManager):
             articulation_ids: Mapping from ``(world, arti)`` to model articulation
                 index. Shape ``(world_count, count_per_world)``. Obtained from
                 ``ArticulationView.articulation_ids``.
+            world_ids: Optional mapping from view rows to original model worlds.
         """
         cls._mark_transforms_changed()
 
@@ -1079,7 +1121,23 @@ class NewtonManager(PhysicsManager):
             return
         NewtonManager.kinematics_dirty = True
 
-        if articulation_ids is not None and env_mask is not None:
+        if articulation_ids is not None and world_ids is not None and env_mask is not None:
+            wp.launch(
+                _or_indexed_reset_masks,
+                dim=articulation_ids.shape,
+                inputs=[env_mask, world_ids, articulation_ids],
+                outputs=[NewtonManager._world_reset_mask, NewtonManager._fk_reset_mask],
+                device=PhysicsManager._device,
+            )
+        elif articulation_ids is not None and world_ids is not None and env_ids is not None:
+            wp.launch(
+                _SCATTER_INDEXED_RESET_MASKS.select(env_ids),
+                dim=(env_ids.shape[0], articulation_ids.shape[1]),
+                inputs=[env_ids, world_ids, articulation_ids],
+                outputs=[NewtonManager._world_reset_mask, NewtonManager._fk_reset_mask],
+                device=PhysicsManager._device,
+            )
+        elif articulation_ids is not None and env_mask is not None:
             wp.launch(
                 _or_reset_masks_from_mask,
                 dim=articulation_ids.shape,
@@ -1898,6 +1956,9 @@ class NewtonManager(PhysicsManager):
             num_envs=cls._num_envs,
             num_joints=dofs_per_env,
             dof_offset=0,
+            dof_world=np.repeat(
+                cls.backend.model.joint_world.numpy(), np.diff(cls.backend.model.joint_qd_start.numpy())
+            ),
             device=PhysicsManager._device,
         )
         cls._adapter.finalize(cls.backend.control)
@@ -1915,6 +1976,12 @@ class NewtonManager(PhysicsManager):
         registered callbacks fire in registration order each step.
         """
         cls._post_actuator_callbacks.append(callback)
+
+    @classmethod
+    def unregister_post_actuator_callback(cls, callback: Callable[[], None]) -> None:
+        """Release a model-specific actuator callback when its asset is rebuilt."""
+        if callback in cls._post_actuator_callbacks:
+            cls._post_actuator_callbacks.remove(callback)
 
     @classmethod
     def register_state_force_callback(cls, callback: Callable[[State], None]) -> None:

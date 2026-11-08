@@ -218,6 +218,44 @@ def test_create_render_data_uses_unique_sdf_safe_render_product_name(render_data
 
 
 @pytest.mark.parametrize(
+    ("columns", "grid", "resolution"),
+    [(None, (4, 3), (256, 192)), (5, (5, 2), (320, 128)), (99, (10, 1), (640, 64))],
+)
+def test_tile_layout_authors_native_product_without_changing_camera_optics(
+    render_data_setup, monkeypatch, columns, grid, resolution
+):
+    """The decoder grid describes the actual USD canvas, including clamping and the default layout."""
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdRender
+
+    setup = render_data_setup
+    stage = Usd.Stage.CreateInMemory()
+    setup.spec.camera_prim_paths = [f"/World/Camera_{index}" for index in range(10)]
+    for path in setup.spec.camera_prim_paths:
+        camera = UsdGeom.Camera.Define(stage, path)
+        camera.CreateFocalLengthAttr(13.0)
+        camera.CreateHorizontalApertureAttr(20.955)
+    product = UsdRender.Product.Define(stage, setup.render_product.path)
+    product.CreateResolutionAttr(Gf.Vec2i(256, 192))
+    product.CreateCameraRel().SetTargets(setup.spec.camera_prim_paths)
+    product.GetPrim().CreateAttribute("omni:rtx:post:aa:op", Sdf.ValueTypeNames.Token).Set("dlss")
+    fabric = MagicMock()
+    fabric.SelectPrims.return_value.GetCount.return_value = 10
+    monkeypatch.setattr(setup.stage_utils, "get_current_stage", lambda **kw: fabric if kw.get("fabric") else stage)
+    setup.renderer.cfg.tile_columns = columns
+
+    result = setup.renderer.create_render_data(setup.spec)
+
+    assert result.tile_grid == grid
+    assert tuple(product.GetResolutionAttr().Get()) == resolution
+    tile_size = product.GetPrim().GetAttribute("omni:rtx:viewTile:resolution")
+    assert tuple(tile_size.Get()) == (64, 64) if columns is not None else not tile_size.HasAuthoredValue()
+    assert product.GetCameraRel().GetTargets() == [Sdf.Path(path) for path in setup.spec.camera_prim_paths]
+    assert product.GetPrim().GetAttribute("omni:rtx:post:aa:op").Get() == "dlss"
+    for path in setup.spec.camera_prim_paths:
+        assert UsdGeom.Camera(stage.GetPrimAtPath(path)).GetFocalLengthAttr().Get() == 13.0
+
+
+@pytest.mark.parametrize(
     ("colorize", "mapping", "semantic_filter", "expected_filter", "expected_mapping"),
     [
         pytest.param(False, {}, "class:apple", "class:apple", None, id="raw-ids-empty-mapping"),
@@ -569,6 +607,7 @@ def test_render_treats_empty_annotator_frame_as_not_ready(monkeypatch, data_type
             cfg=SimpleNamespace(width=64, height=64),
         ),
         renderer_info={},
+        tile_grid=(1, 1),
         ppisp_pipeline=None,
         _hdr_scratch_wp=None,
     )
@@ -590,26 +629,44 @@ def test_render_treats_empty_annotator_frame_as_not_ready(monkeypatch, data_type
 
 
 @pytest.mark.parametrize(
-    ("data_type", "num_channels"),
-    [("normals", 3), ("motion_vectors", 2)],
+    ("data_type", "num_channels", "source_channels", "dtype", "grid", "view_count"),
+    [
+        ("normals", 3, 4, np.float32, (5, 2), 10),
+        ("motion_vectors", 2, 4, np.float32, (2, 2), 4),
+        ("rgba", 4, 4, np.uint8, (5, 2), 10),
+        ("distance_to_image_plane", 1, 1, np.float32, (5, 2), 10),
+    ],
 )
-def test_render_keeps_leading_channels_of_padded_annotator_tiles(monkeypatch, data_type, num_channels):
-    """Four-channel annotator tiles are split per camera, keeping only the output's leading channels."""
+def test_render_decodes_authored_grid_and_preserves_output_channels(
+    monkeypatch, data_type, num_channels, source_channels, dtype, grid, view_count
+):
+    """Native scalar/RGBA/vector atlases retain each view's pixels with a non-default grid."""
     _install_omni_stubs(monkeypatch)
     import isaaclab_physx.renderers.isaac_rtx_renderer as rtx_renderer
     from isaaclab_physx.renderers.isaac_rtx_renderer_cfg import IsaacRtxRendererCfg
 
-    # Four 2x3 cameras tiled on a 2x2 grid; every source value is distinct.
-    view_count, height, width = 4, 2, 3
-    tiled = np.arange(2 * height * 2 * width * 4, dtype=np.float32).reshape(2 * height, 2 * width, 4)
+    height, width = 2, 3
+    columns, rows = grid
+    tiled = np.zeros((rows * height, columns * width, source_channels), dtype=dtype)
+    expected = []
+    for index in range(view_count):
+        tile = (np.arange(height * width * source_channels) + index * 23).astype(dtype)
+        tile = tile.reshape(height, width, source_channels)
+        row, col = divmod(index, columns)
+        tiled[row * height : (row + 1) * height, col * width : (col + 1) * width] = tile
+        expected.append(tile[..., :num_channels])
+    if source_channels == 1:
+        tiled = tiled[..., 0]  # Native depth annotators expose a scalar 2-D atlas.
     annotator = MagicMock()
     annotator.get_data.return_value = tiled
-    output_buffer = wp.zeros((view_count, height, width, num_channels), dtype=wp.float32, device="cpu")
+    output_dtype = wp.uint8 if dtype is np.uint8 else wp.float32
+    output_buffer = wp.zeros((view_count, height, width, num_channels), dtype=output_dtype, device="cpu")
     render_data = SimpleNamespace(
         annotators={data_type: annotator},
         output_data={data_type: SimpleNamespace(warp=output_buffer)},
         spec=SimpleNamespace(view_count=view_count, device="cpu", cfg=SimpleNamespace(width=width, height=height)),
         renderer_info={},
+        tile_grid=grid,
         ppisp_pipeline=None,
         _hdr_scratch_wp=None,
     )
@@ -619,14 +676,16 @@ def test_render_keeps_leading_channels_of_padded_annotator_tiles(monkeypatch, da
     with patch.object(rtx_renderer, "ensure_isaac_rtx_render_update"):
         renderer.render(render_data)
 
-    expected = np.stack(
-        [
-            tiled[row * height : (row + 1) * height, col * width : (col + 1) * width, :num_channels]
-            for row in range(2)
-            for col in range(2)
-        ]
-    )
-    np.testing.assert_array_equal(output_buffer.numpy(), expected)
+    np.testing.assert_array_equal(output_buffer.numpy(), np.stack(expected))
+    if data_type == "rgba":
+        # A stale/default atlas must fail before reinterpretation can misindex memory.
+        annotator.get_data.return_value = np.zeros((3 * height, 4 * width, 4), dtype=np.uint8)
+        with (
+            patch.object(rtx_renderer, "ensure_isaac_rtx_render_update"),
+            pytest.raises(ValueError, match="annotator image has size"),
+        ):
+            renderer._read_annotator_output(render_data)
+        np.testing.assert_array_equal(output_buffer.numpy(), np.stack(expected))
 
 
 @pytest.mark.parametrize(
@@ -663,6 +722,7 @@ def test_render_batch_updates_once_before_extracting_ready_cameras(monkeypatch, 
                     else SimpleNamespace(view_count=1, device="cpu", cfg=SimpleNamespace(width=1, height=1))
                 ),
                 renderer_info={},
+                tile_grid=(1, 1),
                 ppisp_pipeline=None,
                 _hdr_scratch_wp=None,
             )

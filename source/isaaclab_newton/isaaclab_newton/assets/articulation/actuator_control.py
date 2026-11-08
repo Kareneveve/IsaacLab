@@ -11,7 +11,9 @@ import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+import torch
 import warp as wp
+from newton import Model as NewtonModel
 
 from isaaclab.actuators import ActuatorCollection
 from isaaclab.actuators.actuator_base_cfg import _is_implicit_actuator_cfg
@@ -71,11 +73,22 @@ class NewtonActuatorControl(ArticulationActuatorControl):
         articulation = self._articulation
         adapter = SimulationManager._adapter
         if adapter is not None:
-            arti_start = self._joint_dof_offset()
+            dof_layout = articulation._root_view.frequency_layouts[NewtonModel.AttributeFrequency.JOINT_DOF]
+            if dof_layout.uses_explicit_model_indices:
+                indices = dof_layout.get_model_indices()
+            else:
+                indices = wp.array(
+                    dof_layout.get_absolute_indices(articulation._root_view.world_count, 1),
+                    dtype=wp.int32,
+                    device=self.device,
+                )
+            indices = indices.reshape((self.num_instances, self.num_joints))
             binding = adapter.bind_articulation(
                 implicit_joint_indices=collection._implicit_group_joint_indices(),
-                dof_offset=arti_start,
+                dof_offset=0,
                 num_joints=self.num_joints,
+                native_dof_indices=indices,
+                world_ids=articulation._root_view.world_ids,
             )
             articulation.newton_actuator_adapter = adapter
             articulation._implicit_dof_mask = binding.implicit_dof_mask
@@ -96,7 +109,10 @@ class NewtonActuatorControl(ArticulationActuatorControl):
         def _post_actuator() -> None:
             # Telemetry reads _sim_bind_joint_pos inside the decimation loop, ahead of the
             # post-step gather, so the DOF-space view is re-derived here.
+            articulation._data._indexed_bindings.refresh("joint_q", "joint_qd", "joint_f")
             articulation._data._gather_joint_coordinates()
+            if adapter is not None:
+                binding.refresh_computed_effort()
             wp.launch(
                 actuator_kernels.sync_torque_telemetry,
                 dim=(self.num_instances, self.num_joints),
@@ -121,6 +137,9 @@ class NewtonActuatorControl(ArticulationActuatorControl):
                 device=self.device,
             )
 
+        if (previous := getattr(articulation, "_post_actuator_callback", None)) is not None:
+            SimulationManager.unregister_post_actuator_callback(previous)
+        articulation._post_actuator_callback = _post_actuator
         SimulationManager.register_post_actuator_callback(_post_actuator)
 
         if adapter is None:
@@ -196,9 +215,25 @@ class NewtonActuatorControl(ArticulationActuatorControl):
                 articulation._ALL_ENV_MASK,
             )
 
+        keys = ["joint_f"]
+        if write_pos_target:
+            keys.append("joint_target_q")
+        if write_vel_target:
+            keys.append("joint_target_qd")
+        if write_joint_act:
+            keys.append("joint_act")
+        data._indexed_bindings.flush(*keys)
+
     def reset_native_actuators(self, env_ids: Sequence[int] | slice) -> None:
         if self._native_actuator_path_active and SimulationManager._adapter is not None:
-            SimulationManager._adapter.reset(env_ids)
+            worlds = wp.to_torch(self._articulation._root_view.world_ids)
+            if env_ids is None:
+                selected_worlds = worlds
+            elif isinstance(env_ids, slice):
+                selected_worlds = worlds[env_ids]
+            else:
+                selected_worlds = worlds[torch.as_tensor(env_ids, dtype=torch.long, device=worlds.device)]
+            SimulationManager._adapter.reset(selected_worlds)
 
     def _joint_dof_offset(self) -> int:
         """Return the first selected joint DOF's model offset within an environment."""

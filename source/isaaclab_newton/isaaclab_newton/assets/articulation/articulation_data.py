@@ -29,6 +29,7 @@ from isaaclab_newton.assets.articulation.joint_coordinates import (
 from isaaclab_newton.physics import NewtonManager as SimulationManager
 
 from ..kernels import vec13f
+from .indexed_bindings import IndexedBindings
 
 if TYPE_CHECKING:
     from newton.selection import ArticulationView
@@ -121,6 +122,9 @@ class ArticulationData(BaseArticulationData):
         self.FORWARD_VEC_B = ProxyArray(wp.array(forward_vec, dtype=wp.vec3f, device=self.device))
 
         self._create_simulation_bindings()
+        if self._indexed_bindings.enabled:
+            self.GRAVITY_VEC_W = ProxyArray(wp.empty(self._root_view.count, dtype=wp.vec3, device=self.device))
+            self._indexed_bindings.refresh_gravity(self.GRAVITY_VEC_W.warp)
         self._create_buffers()
 
     @property
@@ -161,6 +165,7 @@ class ArticulationData(BaseArticulationData):
     def _update_body_state(self) -> None:
         """Resolve shared FK, then refresh this view's reordered body state after a manual write."""
         SimulationManager.forward()
+        self._indexed_bindings.refresh("body_q", "body_qd")
         if self._body_state_dirty or SimulationManager.transforms_may_change_on_graph_replay:
             self._refresh_user_order_body_state()
 
@@ -203,7 +208,10 @@ class ArticulationData(BaseArticulationData):
         )
         self._body_state_dirty = True
         SimulationManager.invalidate_fk(
-            env_mask=env_mask, env_ids=env_ids, articulation_ids=self._root_view.articulation_ids
+            env_mask=env_mask,
+            env_ids=env_ids,
+            articulation_ids=self._root_view.articulation_ids,
+            world_ids=self._root_view.world_ids if self._indexed_bindings.enabled else None,
         )
 
     def _reset_velocity(
@@ -241,7 +249,10 @@ class ArticulationData(BaseArticulationData):
         )
         self._body_state_dirty = True
         SimulationManager.invalidate_fk(
-            env_mask=env_mask, env_ids=env_ids, articulation_ids=self._root_view.articulation_ids
+            env_mask=env_mask,
+            env_ids=env_ids,
+            articulation_ids=self._root_view.articulation_ids,
+            world_ids=self._root_view.world_ids if self._indexed_bindings.enabled else None,
         )
 
     def _reset_body_com_pose_b_dependents(self) -> None:
@@ -392,6 +403,9 @@ class ArticulationData(BaseArticulationData):
 
         In the case of explicit actuators, the value for the corresponding joints is zero.
         """
+        self._refresh_indexed_property(
+            "joint_target_ke", self._sim_bind_joint_stiffness_sim, self._joint_stiffness_user, self.joint_ordering
+        )
         return self._joint_stiffness_ta
 
     @property
@@ -402,6 +416,9 @@ class ArticulationData(BaseArticulationData):
 
         In the case of explicit actuators, the value for the corresponding joints is zero.
         """
+        self._refresh_indexed_property(
+            "joint_target_kd", self._sim_bind_joint_damping_sim, self._joint_damping_user, self.joint_ordering
+        )
         return self._joint_damping_ta
 
     @property
@@ -410,6 +427,9 @@ class ArticulationData(BaseArticulationData):
 
         Shape is (num_instances, num_joints), dtype = wp.float32. In torch this resolves to (num_instances, num_joints).
         """
+        self._refresh_indexed_property(
+            "joint_armature", self._sim_bind_joint_armature, self._joint_armature_user, self.joint_ordering
+        )
         return self._joint_armature_ta
 
     @property
@@ -425,6 +445,9 @@ class ArticulationData(BaseArticulationData):
 
         Shape is (num_instances, num_joints), dtype = wp.float32. In torch this resolves to (num_instances, num_joints).
         """
+        self._refresh_indexed_property(
+            "joint_friction", self._sim_bind_joint_friction_coeff, self._joint_friction_coeff_user, self.joint_ordering
+        )
         return self._joint_friction_coeff_ta
 
     @property
@@ -434,16 +457,34 @@ class ArticulationData(BaseArticulationData):
         Shape is (num_instances, num_joints), dtype = wp.float32. In torch this resolves to
         (num_instances, num_joints).
         """
+        self._refresh_indexed_property(
+            "joint_damping",
+            self._sim_bind_joint_viscous_friction_coeff,
+            self._joint_viscous_friction_user,
+            self.joint_ordering,
+        )
         return self._joint_viscous_friction_coeff_ta
 
     @property
     def joint_pos_limits_lower(self) -> ProxyArray:
         """Joint position limits lower provided to the simulation. Shape is (num_instances, num_joints)."""
+        self._refresh_indexed_property(
+            "joint_limit_lower",
+            self._sim_bind_joint_pos_limits_lower,
+            self._joint_pos_limits_lower_user,
+            self.joint_ordering,
+        )
         return self._joint_pos_limits_lower_ta
 
     @property
     def joint_pos_limits_upper(self) -> ProxyArray:
         """Joint position limits upper provided to the simulation. Shape is (num_instances, num_joints)."""
+        self._refresh_indexed_property(
+            "joint_limit_upper",
+            self._sim_bind_joint_pos_limits_upper,
+            self._joint_pos_limits_upper_user,
+            self.joint_ordering,
+        )
         return self._joint_pos_limits_upper_ta
 
     @property
@@ -461,12 +502,8 @@ class ArticulationData(BaseArticulationData):
             )
             self._joint_pos_limits_ta = ProxyArray(self._joint_pos_limits.data)
         if self._joint_pos_limits.timestamp < self._sim_timestamp:
-            joint_pos_limits_lower = (
-                self._joint_pos_limits_lower_user if self.has_joint_ordering else self._sim_bind_joint_pos_limits_lower
-            )
-            joint_pos_limits_upper = (
-                self._joint_pos_limits_upper_user if self.has_joint_ordering else self._sim_bind_joint_pos_limits_upper
-            )
+            joint_pos_limits_lower = self.joint_pos_limits_lower.warp
+            joint_pos_limits_upper = self.joint_pos_limits_upper.warp
             self._read_launch_cache.launch(
                 "joint_pos_limits",
                 articulation_kernels.concat_joint_pos_limits_lower_and_upper,
@@ -483,6 +520,12 @@ class ArticulationData(BaseArticulationData):
 
         Shape is (num_instances, num_joints), dtype = wp.float32. In torch this resolves to (num_instances, num_joints).
         """
+        self._refresh_indexed_property(
+            "joint_velocity_limit",
+            self._sim_bind_joint_vel_limits_sim,
+            self._joint_vel_limits_user,
+            self.joint_ordering,
+        )
         return self._joint_vel_limits_ta
 
     @property
@@ -491,6 +534,12 @@ class ArticulationData(BaseArticulationData):
 
         Shape is (num_instances, num_joints), dtype = wp.float32. In torch this resolves to (num_instances, num_joints).
         """
+        self._refresh_indexed_property(
+            "joint_effort_limit",
+            self._sim_bind_joint_effort_limits_sim,
+            self._joint_effort_limits_user,
+            self.joint_ordering,
+        )
         return self._joint_effort_limits_ta
 
     """
@@ -647,6 +696,7 @@ class ArticulationData(BaseArticulationData):
         This quantity is the pose of the articulation root's actor frame relative to the world.
         The orientation is provided in (x, y, z, w) format.
         """
+        self._indexed_bindings.refresh("root_pose")
         return self._root_link_pose_w_ta
 
     @property
@@ -662,6 +712,7 @@ class ArticulationData(BaseArticulationData):
         if self._root_link_vel_w.data is None:
             self._root_link_vel_w.data = ProxyArray(wp.empty(self._num_instances, wp.spatial_vectorf, self.device))
         if self._root_link_vel_w.timestamp < self._sim_timestamp:
+            self._indexed_bindings.refresh("body_com")
             self._read_launch_cache.launch(
                 "root_link_vel_w",
                 shared_kernels.get_root_link_vel_from_root_com_vel,
@@ -686,6 +737,7 @@ class ArticulationData(BaseArticulationData):
         if self._root_com_pose_w.data is None:
             self._root_com_pose_w.data = ProxyArray(wp.empty(self._num_instances, wp.transformf, self.device))
         if self._root_com_pose_w.timestamp < self._sim_timestamp:
+            self._indexed_bindings.refresh("body_com")
             self._read_launch_cache.launch(
                 "root_com_pose_w",
                 shared_kernels.get_root_com_pose_from_root_link_pose,
@@ -706,6 +758,7 @@ class ArticulationData(BaseArticulationData):
         This quantity contains the linear and angular velocities of the articulation root's center of mass frame
         relative to the world.
         """
+        self._indexed_bindings.refresh("root_velocity")
         return self._root_com_vel_w_ta
 
     """
@@ -721,6 +774,7 @@ class ArticulationData(BaseArticulationData):
         With body ordering active, direct writes to the Newton model arrays bypass the public-order
         buffers; use the asset setters instead.
         """
+        self._refresh_indexed_property("body_mass", self._sim_bind_body_mass, self._body_mass_user, self.body_ordering)
         return self._body_mass_ta
 
     @property
@@ -730,6 +784,9 @@ class ArticulationData(BaseArticulationData):
         Shape is (num_instances, num_bodies, 9), dtype = wp.float32. In torch this resolves to
         (num_instances, num_bodies, 9).
         """
+        self._refresh_indexed_property(
+            "body_inertia", self._sim_bind_body_inertia, self._body_inertia_user, self.body_ordering
+        )
         return self._body_inertia_ta
 
     @property
@@ -848,6 +905,9 @@ class ArticulationData(BaseArticulationData):
 
         This quantity is the center of mass location relative to its body's link frame.
         """
+        self._refresh_indexed_property(
+            "body_com", self._sim_bind_body_com_pos_b, self._body_com_pos_b_user, self.body_ordering
+        )
         return self._body_com_pos_b_ta
 
     @property
@@ -1068,6 +1128,10 @@ class ArticulationData(BaseArticulationData):
         Shape is (num_instances, num_joints), dtype = wp.float32. In torch this resolves to
         (num_instances, num_joints).
         """
+        if self._indexed_bindings.enabled and not self._indexed_bindings.writing:
+            self._indexed_bindings.refresh("joint_q", "joint_qd")
+            self._gather_joint_coordinates()
+            self._refresh_user_order_joint_state()
         return self._joint_pos_ta
 
     @property
@@ -1077,6 +1141,10 @@ class ArticulationData(BaseArticulationData):
         Shape is (num_instances, num_joints), dtype = wp.float32. In torch this resolves to
         (num_instances, num_joints).
         """
+        if self._indexed_bindings.enabled and not self._indexed_bindings.writing:
+            self._indexed_bindings.refresh("joint_q", "joint_qd")
+            self._gather_joint_coordinates()
+            self._refresh_user_order_joint_state()
         return self._joint_vel_ta
 
     @property
@@ -1116,6 +1184,9 @@ class ArticulationData(BaseArticulationData):
 
         Shape is (num_instances), dtype = wp.vec3f. In torch this resolves to (num_instances, 3).
         """
+        if self._indexed_bindings.enabled:
+            self._indexed_bindings.refresh_gravity(self.GRAVITY_VEC_W.warp)
+            self._projected_gravity_b.timestamp = -1.0
         if self._projected_gravity_b.data is None:
             self._projected_gravity_b.data = ProxyArray(wp.empty(self._num_instances, wp.vec3f, self.device))
         if self._projected_gravity_b.timestamp < self._sim_timestamp:
@@ -1509,18 +1580,36 @@ class ArticulationData(BaseArticulationData):
             self._body_com_quat_b_ta = ProxyArray(self._get_quat_from_transform(body_com_pose_b))
         return self._body_com_quat_b_ta
 
+    def _refresh_indexed_property(self, key, backend, user, ordering) -> None:
+        """Refresh a sim-owned property without replacing public alias pointers."""
+        if not self._indexed_bindings.enabled or self._indexed_bindings.writing:
+            return
+        self._indexed_bindings.refresh(key)
+        if ordering is not None:
+            kernel = (
+                ordering_kernels.reorder_3d_backend_to_user
+                if backend.ndim == 3
+                else ordering_kernels.reorder_2d_backend_to_user
+            )
+            self._read_launch_cache.launch(
+                "indexed_property_" + key,
+                kernel,
+                dim=backend.shape,
+                inputs=[backend, ordering.user_to_backend],
+                outputs=[user],
+            )
+
     def _create_simulation_bindings(self) -> None:
         """Create simulation bindings for the root data.
 
-        Direct simulation bindings are pointers to the simulation data, their data is not copied, and should
-        only be updated using warp kernels. Any modifications made to the bindings will be reflected in the simulation.
-        Hence we encourage users to carefully think about the data they modify and in which order it should be updated.
-
-        .. caution:: This is possible if and only if the properties that we access are strided from newton and not
-        indexed. Newton willing this is the case all the time, but we should pay attention to this if things look off.
+        Regular layouts alias Newton memory. Explicitly indexed layouts use stable
+        gather buffers; the articulation writers scatter selected rows back to the
+        full native model, and reads refresh those buffers from the active state.
         """
         # A full Newton reset recreates model/state arrays, invalidating recorded pointers.
         self._read_launch_cache.clear()
+        self._root_view._get_attribute_array.cache_clear()
+        self._indexed_bindings = IndexedBindings(self._root_view)
 
         # Short-hand for the number of instances, number of links, and number of joints.
         self._num_instances = self._root_view.count
@@ -1530,34 +1619,42 @@ class ArticulationData(BaseArticulationData):
         self._num_spatial_tendons = 0  # spatial tendons not supported
 
         # -- root properties
-        self._sim_bind_root_link_pose_w = self._root_view.get_root_transforms(SimulationManager.get_state_0())[:, 0]
+        self._sim_bind_root_link_pose_w = self._indexed_bindings.get_root_transforms(SimulationManager.get_state_0())[
+            :, 0
+        ]
         # ``get_root_velocities`` returns ``None`` for fixed-base articulations; the
         # ``wp.zeros`` fallback set by :meth:`_create_buffers` must survive subsequent
         # resets, so only overwrite when the solver actually exposes the binding.
-        root_vel_w = self._root_view.get_root_velocities(SimulationManager.get_state_0())
+        root_vel_w = self._indexed_bindings.get_root_velocities(SimulationManager.get_state_0())
         if root_vel_w is not None:
             if self._root_view.is_fixed_base:
                 self._sim_bind_root_com_vel_w = root_vel_w[:, 0, 0]
             else:
                 self._sim_bind_root_com_vel_w = root_vel_w[:, 0]
         # -- body properties
-        self._sim_bind_body_com_pos_b = self._root_view.get_attribute("body_com", SimulationManager.get_model())[:, 0]
-        self._sim_bind_body_link_pose_w = self._root_view.get_link_transforms(SimulationManager.get_state_0())[:, 0]
-        body_com_vel_w = self._root_view.get_link_velocities(SimulationManager.get_state_0())
-        if body_com_vel_w is not None:
-            self._sim_bind_body_com_vel_w = body_com_vel_w[:, 0]
-        self._sim_bind_body_mass = self._root_view.get_attribute("body_mass", SimulationManager.get_model())[:, 0]
-        self._sim_bind_body_inv_mass = self._root_view.get_attribute("body_inv_mass", SimulationManager.get_model())[
+        self._sim_bind_body_com_pos_b = self._indexed_bindings.get_attribute("body_com", SimulationManager.get_model())[
             :, 0
         ]
-        self._sim_bind_body_inv_inertia = self._root_view.get_attribute(
+        self._sim_bind_body_link_pose_w = self._indexed_bindings.get_link_transforms(SimulationManager.get_state_0())[
+            :, 0
+        ]
+        body_com_vel_w = self._indexed_bindings.get_link_velocities(SimulationManager.get_state_0())
+        if body_com_vel_w is not None:
+            self._sim_bind_body_com_vel_w = body_com_vel_w[:, 0]
+        self._sim_bind_body_mass = self._indexed_bindings.get_attribute("body_mass", SimulationManager.get_model())[
+            :, 0
+        ]
+        self._sim_bind_body_inv_mass = self._indexed_bindings.get_attribute(
+            "body_inv_mass", SimulationManager.get_model()
+        )[:, 0]
+        self._sim_bind_body_inv_inertia = self._indexed_bindings.get_attribute(
             "body_inv_inertia", SimulationManager.get_model()
         )[:, 0]
         # Newton stores body_inertia as (N, 1, B) mat33f — the [:, 0] removes the padding dim
         # giving (N, B) mat33f. Reinterpret as (N, B, 9) float32 via pointer aliasing.
         # Each mat33f element is 9 contiguous float32 values (36 bytes), so the inner stride is 4.
         # The slice may be non-contiguous in the outer dims, so we preserve those strides.
-        _body_inertia_raw = self._root_view.get_attribute("body_inertia", SimulationManager.get_model())[:, 0]
+        _body_inertia_raw = self._indexed_bindings.get_attribute("body_inertia", SimulationManager.get_model())[:, 0]
         self._sim_bind_body_inertia = wp.array(
             ptr=_body_inertia_raw.ptr,
             dtype=wp.float32,
@@ -1566,42 +1663,42 @@ class ArticulationData(BaseArticulationData):
             device=_body_inertia_raw.device,
             copy=False,
         )
-        self._sim_bind_body_external_wrench = self._root_view.get_attribute("body_f", SimulationManager.get_state_0())[
-            :, 0
-        ]
+        self._sim_bind_body_external_wrench = self._indexed_bindings.get_attribute(
+            "body_f", SimulationManager.get_state_0()
+        )[:, 0]
         try:
-            self._sim_bind_body_parent_f = self._root_view.get_attribute(
+            self._sim_bind_body_parent_f = self._indexed_bindings.get_attribute(
                 "body_parent_f", SimulationManager.get_state_0()
             )[:, 0]
         except Exception:
             self._sim_bind_body_parent_f = None
         # -- joint properties
         if self._num_joints > 0:
-            self._sim_bind_joint_pos_limits_lower = self._root_view.get_attribute(
+            self._sim_bind_joint_pos_limits_lower = self._indexed_bindings.get_attribute(
                 "joint_limit_lower", SimulationManager.get_model()
             )[:, 0]
-            self._sim_bind_joint_pos_limits_upper = self._root_view.get_attribute(
+            self._sim_bind_joint_pos_limits_upper = self._indexed_bindings.get_attribute(
                 "joint_limit_upper", SimulationManager.get_model()
             )[:, 0]
-            self._sim_bind_joint_stiffness_sim = self._root_view.get_attribute(
+            self._sim_bind_joint_stiffness_sim = self._indexed_bindings.get_attribute(
                 "joint_target_ke", SimulationManager.get_model()
             )[:, 0]
-            self._sim_bind_joint_damping_sim = self._root_view.get_attribute(
+            self._sim_bind_joint_damping_sim = self._indexed_bindings.get_attribute(
                 "joint_target_kd", SimulationManager.get_model()
             )[:, 0]
-            self._sim_bind_joint_viscous_friction_coeff = self._root_view.get_attribute(
+            self._sim_bind_joint_viscous_friction_coeff = self._indexed_bindings.get_attribute(
                 "joint_damping", SimulationManager.get_model()
             )[:, 0]
-            self._sim_bind_joint_armature = self._root_view.get_attribute(
+            self._sim_bind_joint_armature = self._indexed_bindings.get_attribute(
                 "joint_armature", SimulationManager.get_model()
             )[:, 0]
-            self._sim_bind_joint_friction_coeff = self._root_view.get_attribute(
+            self._sim_bind_joint_friction_coeff = self._indexed_bindings.get_attribute(
                 "joint_friction", SimulationManager.get_model()
             )[:, 0]
-            self._sim_bind_joint_vel_limits_sim = self._root_view.get_attribute(
+            self._sim_bind_joint_vel_limits_sim = self._indexed_bindings.get_attribute(
                 "joint_velocity_limit", SimulationManager.get_model()
             )[:, 0]
-            self._sim_bind_joint_effort_limits_sim = self._root_view.get_attribute(
+            self._sim_bind_joint_effort_limits_sim = self._indexed_bindings.get_attribute(
                 "joint_effort_limit", SimulationManager.get_model()
             )[:, 0]
             # -- joint states
@@ -1609,7 +1706,9 @@ class ArticulationData(BaseArticulationData):
             # joint occupies 4 quaternion components against 3 DOFs, so the array is wider than
             # ``num_joints`` whenever the articulation has one. IsaacLab addresses joints by DOF
             # index everywhere, so keep the coordinate array separate and publish a DOF-space view.
-            self._sim_bind_joint_coords = self._root_view.get_dof_positions(SimulationManager.get_state_0())[:, 0]
+            self._sim_bind_joint_coords = self._indexed_bindings.get_dof_positions(SimulationManager.get_state_0())[
+                :, 0
+            ]
             # The view's per-joint counts are already in the column order of the array above and
             # already exclude the free root, fixed joints and loop-closing joints.
             self._joint_coord_map = build_ball_joint_coordinate_map(
@@ -1622,13 +1721,15 @@ class ArticulationData(BaseArticulationData):
                 gather_joint_coordinates(self._joint_coord_map, self._sim_bind_joint_coords, self._sim_bind_joint_pos)
             else:
                 self._sim_bind_joint_pos = self._sim_bind_joint_coords
-            self._sim_bind_joint_vel = self._root_view.get_dof_velocities(SimulationManager.get_state_0())[:, 0]
+            self._sim_bind_joint_vel = self._indexed_bindings.get_dof_velocities(SimulationManager.get_state_0())[:, 0]
             # -- joint commands (sent to the simulation)
-            self._sim_bind_joint_effort = self._root_view.get_attribute("joint_f", SimulationManager.get_control())[
-                :, 0
-            ]
-            self._sim_bind_joint_act = self._root_view.get_attribute("joint_act", SimulationManager.get_control())[:, 0]
-            self._sim_bind_joint_position_target = self._root_view.get_attribute(
+            self._sim_bind_joint_effort = self._indexed_bindings.get_attribute(
+                "joint_f", SimulationManager.get_control()
+            )[:, 0]
+            self._sim_bind_joint_act = self._indexed_bindings.get_attribute(
+                "joint_act", SimulationManager.get_control()
+            )[:, 0]
+            self._sim_bind_joint_position_target = self._indexed_bindings.get_attribute(
                 "joint_target_q", SimulationManager.get_control()
             )[:, 0]
             # ``joint_target_q`` follows ``newton.use_coord_layout_targets``, which defaults to
@@ -1644,7 +1745,7 @@ class ArticulationData(BaseArticulationData):
                 gather_joint_coordinates(
                     self._joint_coord_map, self._sim_bind_joint_target_coords, self._sim_bind_joint_position_target
                 )
-            self._sim_bind_joint_velocity_target = self._root_view.get_attribute(
+            self._sim_bind_joint_velocity_target = self._indexed_bindings.get_attribute(
                 "joint_target_qd", SimulationManager.get_control()
             )[:, 0]
         else:
@@ -1692,14 +1793,14 @@ class ArticulationData(BaseArticulationData):
 
         # assumes all tendons are fixed and only one arti in scene
         if self._root_view.tendon_count > 0:
-            self._sim_bind_fixed_tendon_stiffness = self._root_view.get_attribute(
+            self._sim_bind_fixed_tendon_stiffness = self._indexed_bindings.get_attribute(
                 "mujoco.tendon_stiffness", SimulationManager.get_model()
             )[:, 0]
-            self._sim_bind_fixed_tendon_damping = self._root_view.get_attribute(
+            self._sim_bind_fixed_tendon_damping = self._indexed_bindings.get_attribute(
                 "mujoco.tendon_damping",
                 SimulationManager.get_model(),
             )[:, 0]
-            self._sim_bind_fixed_tendon_pos_limits = self._root_view.get_attribute(
+            self._sim_bind_fixed_tendon_pos_limits = self._indexed_bindings.get_attribute(
                 "mujoco.tendon_range",
                 SimulationManager.get_model(),
             )[:, 0]
@@ -2123,6 +2224,8 @@ class ArticulationData(BaseArticulationData):
         identity-ordered ball-joint articulation the coordinate gather is the only
         work this method does -- the two reorder calls below are no-ops.
         """
+        self._indexed_bindings.refresh("root_pose", "root_velocity", "joint_q", "joint_qd", "body_q", "body_qd")
+        self._indexed_bindings.refresh_gravity(self.GRAVITY_VEC_W.warp)
         # Ahead of the reorder: the user-order shadows have to gather from a current DOF buffer.
         self._gather_joint_coordinates()
         self._refresh_user_order_joint_state()
